@@ -452,6 +452,10 @@ const server = http.createServer(async (req, res) => {
     try { body = JSON.parse(await readBody(req)); }
     catch (e) { return errorResponse(res, 400, 'invalid JSON body: ' + e.message); }
 
+    if (process.env.AGY_DEBUG_PROMPT === '1') {
+      try { fs.writeFileSync('/tmp/agy-debug-body.json', JSON.stringify(body).slice(0, 400000), 'utf8'); } catch {}
+    }
+
     const model = body.model || 'antigravity-gemini-3.8-flash';
     const spec = resolveModel(model);
     const lang = resolveLanguage(req, body, url);
