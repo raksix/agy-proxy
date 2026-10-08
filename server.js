@@ -620,6 +620,11 @@ const server = http.createServer(async (req, res) => {
       clearInterval(hb);
       void lastPing;
 
+      // The tool-detection buffer holds the answer back so a `TOOL_CALL:`
+      // directive never reaches the user as prose. When it turns out to be a
+      // normal answer, flush the whole buffered text in one chunk.
+      const wasBuffered = !liveText && acc.length > 0;
+
       const finalText = r.text || acc;
       // agy died without producing anything (oversized prompt, transient
       // upstream failure). The 200 + SSE headers are already on the wire, so
@@ -638,6 +643,11 @@ const server = http.createServer(async (req, res) => {
       // Only honour a name the caller actually advertised — a hallucinated tool
       // would send Hermes down a dead path.
       const valid = (toolCall && knownTool(tools, toolCall.name)) ? toolCall : null;
+
+      if (!valid && wasBuffered) {
+        sse(res, { id, object: 'chat.completion.chunk', created: now(), model,
+          choices: [{ index: 0, delta: { content: acc }, finish_reason: null }] });
+      }
 
       if (valid) {
         const tcId = 'call_' + Math.random().toString(36).slice(2, 12);
