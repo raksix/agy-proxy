@@ -81,7 +81,18 @@ function buildPrompt(messages, opts = {}) {
     : messages;
   const lines = [];
   for (const m of transcript) {
-    const role = String(m.role || 'user').toUpperCase();
+    // Tool-result turns must stay machine-readable: the agent has to be able to
+    // tell a tool name from its opaque payload, so JSON-encode them whole
+    // instead of stringifying the object into "role: [object Object]".
+    if (m.role === 'tool' || m.role === 'function') {
+      let payload = m.content;
+      if (typeof payload !== 'string') {
+        try { payload = JSON.stringify(payload); } catch { payload = String(payload); }
+      }
+      lines.push(`TOOL RESULT (${m.name || m.tool_call_id || 'tool'}): ${payload}`);
+      continue;
+    }
+
     let content = m.content;
     if (Array.isArray(content)) {
       content = content.map((p) => {
@@ -91,8 +102,45 @@ function buildPrompt(messages, opts = {}) {
         return JSON.stringify(p);
       }).join('\n');
     }
-    lines.push(`${role}: ${content ?? ''}`);
+
+    // An assistant turn that requested tools must show WHAT it asked for,
+    // otherwise the agent re-issues the same call forever after the result.
+    const tcs = Array.isArray(m.tool_calls) ? m.tool_calls : [];
+    if (tcs.length) {
+      const rendered = tcs.map((tc) => {
+        const fn = (tc && tc.function) || {};
+        const args = typeof fn.arguments === 'string' ? fn.arguments : JSON.stringify(fn.arguments || {});
+        return `CALLED ${fn.name || 'unknown'}(${args})`;
+      }).join('\n');
+      const base = content ? `${content}\n` : '';
+      lines.push(`ASSISTANT: ${base}${rendered}`);
+      continue;
+    }
+
+    lines.push(`${String(m.role || 'user').toUpperCase()}: ${content ?? ''}`);
   }
+
+  // Expose the caller's tool catalog so the agent can request one of them
+  // instead of only reaching for its own built-in tools. Without this the
+  // request is silently ignored and the answer is plain text.
+  if (Array.isArray(opts.tools) && opts.tools.length) {
+    lines.push('');
+    lines.push('=== AVAILABLE TOOLS ===');
+    lines.push('When a task needs a tool, reply with EXACTLY this one-line form and nothing else:');
+    lines.push('TOOL_CALL: <name>(<json arguments>)');
+    lines.push('If no tool is needed, answer normally. Never invent a tool name.');
+    for (const t of opts.tools) {
+      const fn = (t && t.function) || t || {};
+      const name = fn.name || 'unknown';
+      const desc = fn.description ? ` — ${String(fn.description).slice(0, 300)}` : '';
+      let params = '';
+      if (fn.parameters) {
+        try { params = ` | params: ${JSON.stringify(fn.parameters)}`.slice(0, 1200); } catch {}
+      }
+      lines.push(`- ${name}${desc}${params}`);
+    }
+  }
+
   // agy runs as an agent, so tell it the last line is the request to answer.
   lines.push('');
   const lang = (opts.language || '').toLowerCase();
@@ -106,6 +154,44 @@ function buildPrompt(messages, opts = {}) {
     lines.push('ASSISTANT now responds to the final request above. Reply directly to it.');
   }
   return lines.join('\n');
+}
+
+/**
+ * Detect a tool request in the model's answer.
+ * Returns { name, args } or null. The model is told to answer with the single
+ * line `TOOL_CALL: name({...})`, so accept that first and fall back to a
+ * generic `name({...})` shape.
+ */
+function parseToolCall(text) {
+  if (!text) return null;
+  const src = String(text);
+  // Search the whole answer: a preamble sentence may precede the directive.
+  const re = /(?:^|\n)\s*(?:TOOL_CALL:\s*)?([A-Za-z_][A-Za-z0-9_.-]*)\s*\((.*)\)\s*$/s;
+  const m = re.exec(src);
+  if (!m) return null;
+
+  const name = m[1];
+  if (name === 'function' || name === 'if' || name === 'for' || name === 'while' || name === 'return') return null;
+
+  let rawArgs = (m[2] || '').trim();
+  if (!rawArgs) return { name, args: {} };
+  // Only accept a parseable JSON object; a prose parenthesis is not a call.
+  try {
+    const parsed = JSON.parse(rawArgs);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return { name, args: parsed };
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** True when the OpenAI `tools` array contains a tool with this name. */
+function knownTool(tools, name) {
+  if (!Array.isArray(tools) || !name) return false;
+  return tools.some((t) => {
+    const fn = (t && t.function) || t || {};
+    return fn.name === name;
+  });
 }
 
 /** Determine target response language from query string, body, headers, or default. */
@@ -361,7 +447,8 @@ const server = http.createServer(async (req, res) => {
     const model = body.model || 'antigravity-gemini-3.8-flash';
     const spec = resolveModel(model);
     const lang = resolveLanguage(req, body, url);
-    const prompt = buildPrompt(body.messages || [], { language: lang });
+    const tools = Array.isArray(body.tools) ? body.tools : [];
+    const prompt = buildPrompt(body.messages || [], { language: lang, tools });
     if (!prompt.trim()) return errorResponse(res, 400, 'no messages');
 
     const controller = new AbortController();
@@ -389,6 +476,10 @@ const server = http.createServer(async (req, res) => {
       // comment heartbeats and surface tool activity as reasoning deltas.
       const hb = setInterval(() => { try { res.write(': hb\n\n'); } catch {} }, 15000);
       let lastPing = Date.now();
+      // Text is buffered (not forwarded live) when tools are on the line: a
+      // directive like `TOOL_CALL: x({})` must not reach the user as prose
+      // before we know whether it is a real call.
+      const liveText = tools.length === 0;
 
       const r = await runAgy({
         slug: spec.slug, effort: spec.effort, prompt,
@@ -396,8 +487,10 @@ const server = http.createServer(async (req, res) => {
         onDelta: (delta) => {
           acc += delta;
           lastPing = Date.now();
-          sse(res, { id, object: 'chat.completion.chunk', created: now(), model,
-            choices: [{ index: 0, delta: { content: delta }, finish_reason: null }] });
+          if (liveText) {
+            sse(res, { id, object: 'chat.completion.chunk', created: now(), model,
+              choices: [{ index: 0, delta: { content: delta }, finish_reason: null }] });
+          }
         },
         onTool: (tool) => {
           lastPing = Date.now();
@@ -410,8 +503,30 @@ const server = http.createServer(async (req, res) => {
       clearInterval(hb);
       void lastPing;
 
-      // If the model answered but the CLI marked ERROR, the answer is still valid.
       const finalText = r.text || acc;
+      const toolCall = (tools.length && finalText) ? parseToolCall(finalText) : null;
+      // Only honour a name the caller actually advertised — a hallucinated tool
+      // would send Hermes down a dead path.
+      const valid = (toolCall && knownTool(tools, toolCall.name)) ? toolCall : null;
+
+      if (valid) {
+        const tcId = 'call_' + Math.random().toString(36).slice(2, 12);
+        sse(res, { id, object: 'chat.completion.chunk', created: now(), model,
+          choices: [{ index: 0, delta: { tool_calls: [{
+            index: 0, id: tcId, type: 'function',
+            function: { name: valid.name, arguments: JSON.stringify(valid.args) },
+          }] }, finish_reason: null }] });
+        sse(res, { id, object: 'chat.completion.chunk', created: now(), model,
+          choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] });
+        sse(res, { id, object: 'chat.completion.chunk', created: now(), model,
+          choices: [], usage: openAIShape(model, '', r.usage, 'tool_calls').usage });
+        res.write('data: [DONE]\n\n');
+        res.end();
+        done();
+        return;
+      }
+
+      // If the model answered but the CLI marked ERROR, the answer is still valid.
       sse(res, { id, object: 'chat.completion.chunk', created: now(), model,
         choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
       sse(res, { id, object: 'chat.completion.chunk', created: now(), model,
@@ -429,6 +544,26 @@ const server = http.createServer(async (req, res) => {
       const msg = (r.error || 'agy produced no output').slice(0, 400);
       return errorResponse(res, 502, msg);
     }
+
+    // Same validation on the non-streaming path: only an advertised tool name
+    // becomes a tool_call, everything else is returned as the answer text.
+    const toolCall = tools.length ? parseToolCall(finalText) : null;
+    if (toolCall && knownTool(tools, toolCall.name)) {
+      const shape = openAIShape(model, '', r.usage, 'tool_calls');
+      shape.choices[0].message = {
+        role: 'assistant', content: null,
+        tool_calls: [{
+          id: 'call_' + Math.random().toString(36).slice(2, 12),
+          type: 'function',
+          function: { name: toolCall.name, arguments: JSON.stringify(toolCall.args) },
+        }],
+      };
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(shape));
+      done();
+      return;
+    }
+
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify(openAIShape(model, finalText, r.usage, 'stop')));
     done();
