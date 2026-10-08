@@ -165,7 +165,7 @@ function runPlain(args, timeoutMs = 30000) {
  * model actually produced an answer, even when the CLI stamps the run ERROR
  * after the fact (transient Gemini 503s hit post-processing).
  */
-function runAgy({ slug, effort, prompt, signal, onDelta }) {
+function runAgy({ slug, effort, prompt, signal, onDelta, onTool }) {
   return new Promise((resolve, reject) => {
     // Pass prompt via stdin using `--input-format text` so the prompt size
     // is unlimited and never hits kernel exec argv limits (E2BIG).
@@ -229,6 +229,12 @@ function runAgy({ slug, effort, prompt, signal, onDelta }) {
           if (su.step_type === 'agent_response' && su.text_delta) {
             text += su.text_delta;
             if (onDelta) onDelta(su.text_delta);
+          }
+          // A tool step going ACTIVE means the agent is mid-action and will
+          // emit nothing else for a while — report it so the client can show
+          // progress instead of treating the silence as a stall.
+          if (su.tool_name && su.state === 'ACTIVE' && onTool) {
+            onTool(su.tool_name);
           }
           if (su.usage) usage = su.usage;
         } else if (ev.event === 'result' && ev.result) {
