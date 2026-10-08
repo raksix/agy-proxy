@@ -621,6 +621,19 @@ const server = http.createServer(async (req, res) => {
       void lastPing;
 
       const finalText = r.text || acc;
+      // agy died without producing anything (oversized prompt, transient
+      // upstream failure). The 200 + SSE headers are already on the wire, so
+      // the only way to tell the client is an in-stream error event plus an
+      // immediate [DONE] — returning a silent finish_reason:"stop" with empty
+      // content makes Hermes retry the identical doomed request.
+      if (!finalText && !(tools.length && parseToolCall(acc))) {
+        sse(res, { error: { message: String(r.error || 'agy produced no output').slice(0, 400), type: 'proxy_error' } });
+        res.write('data: [DONE]\n\n');
+        res.end();
+        done();
+        return;
+      }
+
       const toolCall = (tools.length && finalText) ? parseToolCall(finalText) : null;
       // Only honour a name the caller actually advertised — a hallucinated tool
       // would send Hermes down a dead path.
