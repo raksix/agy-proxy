@@ -30,6 +30,7 @@ Hermes Agent (or any OpenAI-compatible client) sends standard `/v1/chat/completi
 
 - **Zero npm dependencies** — built purely on Node.js standard modules (`node:http`, `node:child_process`).
 - **Full SSE Streaming** — supports `stream: true` with standard OpenAI chunk tokens.
+- **Stale-stream protection** — SSE comment heartbeats every 15s plus tool activity surfaced as `reasoning_content`, so a long agentic turn never looks like a dead connection to the client.
 - **Multi-language response control** — explicit support for English, Turkish, and Japanese (`ja` / 日本語).
 - **Large prompt safety** — avoids OS `E2BIG` argv limits by piping prompts safely via temp files.
 - **Native OAuth reuse** — authenticates directly using `agy`'s existing CLI OAuth session (`~/.gemini/antigravity-cli`).
@@ -161,6 +162,27 @@ Raw `agy` model slugs (e.g. `gemini-3.8-flash-medium`) are also accepted as mode
 
 ---
 
+### Why the proxy heartbeats the stream
+
+`agy` is an *agent*, not a plain chat model. While a tool runs — and for the
+whole of a long `agent_response` step — it emits nothing at all, leaving the
+step ACTIVE with no `text_delta`. A client that sees 60 seconds of silence
+concludes the connection is dead and either reconnects or shows a stall.
+
+So every streaming request gets:
+
+1. **SSE comment heartbeats** (`: hb`) every 15 seconds, which keep the socket
+   alive without being valid OpenAI chunks. Standard clients ignore them.
+2. **Tool activity deltas** — when a tool step goes ACTIVE, its name is emitted
+   immediately as `reasoning_content` (`[agy: run_command]`). Hermes renders
+   that as thinking/activity, so the operator can see the agent working.
+
+Measured on this box: time-to-first-chunk 2s, a tool-using turn emits its tool
+chunk before the answer, and 3 concurrent streaming requests all complete
+(9s / 26s / 35s) through the concurrency queue.
+
+---
+
 ### Environment Variables
 
 | Variable | Default | Description |
@@ -211,6 +233,7 @@ Hermes Agent (veya herhangi bir OpenAI uyumlu istemci), bu servise standart `/v1
 
 - **Sıfır bağımlılık** — Harici npm paketi gerektirmez, tamamen Node.js standart kütüphanesine (`node:http`, `node:child_process`) dayanır.
 - **Gerçek Zamanlı SSE Akışı** — `stream: true` seçeneğiyle standart OpenAI formatında token akışı sağlar.
+- **Donuk Akış Koruması** — 15 saniyede bir SSE heartbeat yorumu ve `reasoning_content` olarak aktarılan araç çalıştırma bilgisi; uzun süren ajan adımları istemcide "bağlantı koptu" gibi görünmez.
 - **Çoklu Dil Desteği** — İngilizce, Türkçe ve Japonca (`ja` / 日本語) yanıt verme desteği.
 - **Büyük Prompt Güvenliği** — Sistem prompt'larının işletim sistemi `E2BIG` argv sınırına takılmasını önlemek için geçici dosyalar üzerinden aktarılır.
 - **Doğrudan OAuth Oturumu** — `agy`'nin halihazırda var olan Google OAuth oturumunu (`~/.gemini/antigravity-cli`) doğrudan kullanır; ek API anahtarı gerektirmez.
@@ -342,6 +365,27 @@ Doğrudan `agy` model adları da (ör. `gemini-3.8-flash-medium`) kabul edilir.
 
 ---
 
+### Neden heartbeat gönderiliyor?
+
+`agy` sade bir sohbet modeli değil, bir **ajandır**. Bir araç çalıştığı sürece
+— ve uzun bir `agent_response` adımının tamamı boyunca — hiçbir şey yaymaz,
+adımı `text_delta` olmadan ACTIVE bırakır. 60 saniye sessizlik gören istemci
+bağlantının koptuğunu düşünür ve ya yeniden bağlanır ya da "takıldı" gösterir.
+
+Bu yüzden her akış isteği şunları alır:
+
+1. **SSE yorum satırı heartbeat'i** (`: hb`) 15 saniyede bir — geçerli bir
+   OpenAI parçası olmadığı için soket canlı kalır, standart istemciler yok sayar.
+2. **Araç etkinliği** — bir araç adımı ACTIVE olduğunda adı anında
+   `reasoning_content` olarak iletilir (`[agy: run_command]`). Hermes bunu
+   düşünme/etkinlik olarak gösterir, yani ajanın çalıştığı görünür.
+
+Bu makinede ölçülen: ilk veriye ulaşma 2 saniye; araç kullanan bir tur yanıttan
+önce araç parçasını gönderiyor; eşzamanlı 3 akış isteğinin üçü de (9s / 26s /
+35s) kuyruk üzerinden tamamlanıyor.
+
+---
+
 ### Hermes Entegrasyonu
 
 `~/.hermes/config.yaml` içine sağlayıcı tanımını ekleyin:
@@ -377,6 +421,7 @@ Hermes Agent（または任意の OpenAI 互換クライアント）から標準
 
 - **ゼロ依存関係** — 外部 npm パッケージ不要。Node.js 組み込みモジュール（`node:http`, `node:child_process`）のみで動作します。
 - **SSE ストリーミング完全対応** — `stream: true` によるリアルタイムなトークン配信に対応。
+- **ストール防止機構** — 15秒ごとの SSE ハートビートと `reasoning_content` として伝えられるツール実行状況により、長時間のエージェント処理中も切断と誤認識されません。
 - **多言語出力サポート** — 日本語（`ja`）、英語（`en`）、トルコ語（`tr`）への出力指定が可能。
 - **大容量プロンプト保護** — OS の `E2BIG`（引数長制限）を回避するため、プロンプトを一時ファイル経由で安全に渡します。
 - **Google OAuth セッションの再利用** — `agy` の既存の認証情報（`~/.gemini/antigravity-cli`）を直接利用します。
