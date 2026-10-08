@@ -23,6 +23,7 @@ const AGY_BIN = process.env.AGY_BIN || '/root/.local/bin/agy';
 const AGY_CWD = process.env.AGY_CWD || '/root/agy-proxy/work';
 const MAX_CONCURRENT = Number(process.env.AGY_MAX_CONCURRENT || 3);
 const REQUEST_TIMEOUT_MS = Number(process.env.AGY_TIMEOUT_MS || 300000);
+const DEFAULT_LANGUAGE = (process.env.AGY_LANGUAGE || '').trim().toLowerCase();
 
 // No API key is injected: agy authenticates through its own OAuth session
 // (antigravity-oauth-token in ~/.gemini/antigravity-cli). A Gemini provider
@@ -94,8 +95,41 @@ function buildPrompt(messages, opts = {}) {
   }
   // agy runs as an agent, so tell it the last line is the request to answer.
   lines.push('');
-  lines.push('ASSISTANT now responds to the final request above. Reply directly to it.');
+  const lang = (opts.language || '').toLowerCase();
+  if (lang === 'ja' || lang === 'japanese' || lang === 'jp') {
+    lines.push('ASSISTANT now responds to the final request above in Japanese. Reply directly to it in Japanese (日本語で回答してください).');
+  } else if (lang === 'tr' || lang === 'turkish') {
+    lines.push('ASSISTANT now responds to the final request above in Turkish. Reply directly to it in Turkish (Türkçe olarak yanıt veriniz).');
+  } else if (lang === 'en' || lang === 'english') {
+    lines.push('ASSISTANT now responds to the final request above in English. Reply directly to it in English.');
+  } else {
+    lines.push('ASSISTANT now responds to the final request above. Reply directly to it.');
+  }
   return lines.join('\n');
+}
+
+/** Determine target response language from query string, body, headers, or default. */
+function resolveLanguage(req, body, url) {
+  const qLang = url.searchParams.get('lang') || url.searchParams.get('language');
+  if (qLang) return qLang.trim().toLowerCase();
+
+  if (body) {
+    const bLang = body.language || body.lang || body.target_language;
+    if (bLang) return String(bLang).trim().toLowerCase();
+  }
+
+  const hLang = req.headers['x-language'] || req.headers['x-lang'];
+  if (hLang) return String(hLang).trim().toLowerCase();
+
+  const acceptLang = req.headers['accept-language'];
+  if (acceptLang) {
+    const primary = acceptLang.split(',')[0].split(';')[0].trim().toLowerCase();
+    if (primary.startsWith('ja')) return 'ja';
+    if (primary.startsWith('tr')) return 'tr';
+    if (primary.startsWith('en')) return 'en';
+  }
+
+  return DEFAULT_LANGUAGE;
 }
 
 function resolveModel(name) {
@@ -289,7 +323,9 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify({
       status: 'ok', auth, authModels,
       gemini_key: USE_GEMINI_KEY ? (GEMINI_KEY ? 'injected' : 'missing') : 'not-used',
-      running, max: MAX_CONCURRENT, version: '1.0.0',
+      running, max: MAX_CONCURRENT, version: '1.1.0',
+      languages: ['en', 'tr', 'ja'],
+      default_language: DEFAULT_LANGUAGE || 'auto',
     }));
   }
 
@@ -318,7 +354,8 @@ const server = http.createServer(async (req, res) => {
 
     const model = body.model || 'antigravity-gemini-3.8-flash';
     const spec = resolveModel(model);
-    const prompt = buildPrompt(body.messages || []);
+    const lang = resolveLanguage(req, body, url);
+    const prompt = buildPrompt(body.messages || [], { language: lang });
     if (!prompt.trim()) return errorResponse(res, 400, 'no messages');
 
     const controller = new AbortController();
@@ -340,15 +377,32 @@ const server = http.createServer(async (req, res) => {
         choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] });
 
       let acc = '';
+      // agy emits nothing while a tool runs, and the agent_response step stays
+      // ACTIVE with no text_delta for minutes. Every client-side stale-stream
+      // watchdog sees that as a dead connection, so keep the socket live with
+      // comment heartbeats and surface tool activity as reasoning deltas.
+      const hb = setInterval(() => { try { res.write(': hb\n\n'); } catch {} }, 15000);
+      let lastPing = Date.now();
+
       const r = await runAgy({
         slug: spec.slug, effort: spec.effort, prompt,
         signal: controller.signal,
         onDelta: (delta) => {
           acc += delta;
+          lastPing = Date.now();
           sse(res, { id, object: 'chat.completion.chunk', created: now(), model,
             choices: [{ index: 0, delta: { content: delta }, finish_reason: null }] });
         },
+        onTool: (tool) => {
+          lastPing = Date.now();
+          // Emitted as reasoning content, which Hermes renders as thinking/activity
+          // rather than polluting the visible answer.
+          sse(res, { id, object: 'chat.completion.chunk', created: now(), model,
+            choices: [{ index: 0, delta: { reasoning_content: `[agy: ${tool}]` }, finish_reason: null }] });
+        },
       });
+      clearInterval(hb);
+      void lastPing;
 
       // If the model answered but the CLI marked ERROR, the answer is still valid.
       const finalText = r.text || acc;
