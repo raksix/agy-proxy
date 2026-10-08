@@ -552,7 +552,10 @@ const server = http.createServer(async (req, res) => {
     if (!prompt.trim()) return errorResponse(res, 400, 'no messages');
 
     if (process.env.AGY_DEBUG_PROMPT === '1') {
-      try { fs.appendFileSync('/tmp/agy-dbg.log', `${Date.now()} proplen=${prompt.length} tools=${tools.length} eff=${effortOverride ?? spec.effort}\n`, 'utf8'); } catch {}
+      try {
+        fs.appendFileSync('/tmp/agy-dbg.log', `${Date.now()} proplen=${prompt.length} tools=${tools.length} eff=${effortOverride ?? spec.effort}\n`, 'utf8');
+        fs.writeFileSync('/tmp/agy-dbg-prompt.txt', prompt, 'utf8');
+      } catch {}
     }
 
     const controller = new AbortController();
