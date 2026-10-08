@@ -74,11 +74,74 @@ function readBody(req, limit = 4 * 1024 * 1024) {
   });
 }
 
+/**
+ * Hard ceiling for the prompt handed to agy.
+ *
+ * The CLI runs a real agent loop with its own toolset, so a system prompt
+ * carries all of its own instructions too. Measured on this box: agy answers
+ * up to ~100k characters and dies SILENTLY (no result event, no error, exit≠0)
+ * above ~130k. A caller receiving that sees an empty answer and retries the
+ * same oversized request forever.
+ */
+const PROMPT_CHAR_LIMIT = Number(process.env.AGY_PROMPT_CHAR_LIMIT || 90000);
+
+/**
+ * Shrink an oversized conversation while keeping the parts that carry meaning.
+ * Order matters: the last user message is the actual request, the first system
+ * message carries the persona, and everything in between is history that can be
+ * truncated from the MIDDLE (oldest turns first).
+ */
+function fitPrompt(messages, limit) {
+  if (messages.length === 0) return messages;
+
+  const measure = (arr) => arr.reduce((n, m) => {
+    const c = typeof m?.content === 'string' ? m.content
+      : Array.isArray(m?.content) ? m.content.map((p) => p?.text || '').join('')
+      : '';
+    return n + c.length + (m?.tool_calls ? 200 : 0);
+  }, 0);
+
+  if (measure(messages) <= limit) return messages;
+
+  const head = messages[0]?.role === 'system' ? [messages[0]] : [];
+  const tail = messages.slice(head.length);
+  const last = tail[tail.length - 1];
+  const middle = tail.slice(0, -1);
+
+  // Keep as many of the most recent turns as fit, then note what was dropped.
+  const kept = [];
+  let budget = limit - measure(head) - measure([last]) - 400;
+  for (let i = middle.length - 1; i >= 0; i--) {
+    const cost = measure([middle[i]]) + 40;
+    if (cost > budget) break;
+    kept.unshift(middle[i]);
+    budget -= cost;
+  }
+  const dropped = middle.length - kept.length;
+
+  const out = [];
+  if (head.length) {
+    // Keep the persona but cap it too: it is the single biggest contributor.
+    const sys = head[0];
+    const raw = typeof sys.content === 'string' ? sys.content : measure([sys]);
+    const cap = Math.max(20000, limit - 30000);
+    if (String(raw).length > cap) {
+      out.push({ ...sys, content: `${String(raw).slice(0, cap)}\n\n[system prompt truncated by agy-proxy: ${String(raw).length} chars → ${cap}]` });
+    } else {
+      out.push(sys);
+    }
+  }
+  if (dropped > 0) {
+    out.push({ role: 'user', content: `[earlier conversation omitted: ${dropped} older message(s) exceeded the prompt limit]` });
+  }
+  out.push(...kept);
+  if (last) out.push(last);
+  return out;
+}
+
 /** Flatten an OpenAI messages array into one plain-text prompt for agy. */
 function buildPrompt(messages, opts = {}) {
-  const transcript = (opts.transcriptMode === 'raw')
-    ? messages
-    : messages;
+  const transcript = fitPrompt(messages, opts.limit || PROMPT_CHAR_LIMIT);
   const lines = [];
   for (const m of transcript) {
     // Tool-result turns must stay machine-readable: the agent has to be able to
@@ -487,6 +550,10 @@ const server = http.createServer(async (req, res) => {
       : null;
     const prompt = buildPrompt(body.messages || [], { language: lang, tools });
     if (!prompt.trim()) return errorResponse(res, 400, 'no messages');
+
+    if (process.env.AGY_DEBUG_PROMPT === '1') {
+      try { fs.appendFileSync('/tmp/agy-dbg.log', `${Date.now()} proplen=${prompt.length} tools=${tools.length} eff=${effortOverride ?? spec.effort}\n`, 'utf8'); } catch {}
+    }
 
     const controller = new AbortController();
     req.on('close', () => controller.abort());
