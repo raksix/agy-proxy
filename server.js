@@ -351,6 +351,12 @@ function runAgy({ slug, effort, prompt, signal, onDelta, onTool }) {
     if (safeEffort && !/-(low|medium|high)$/.test(slug)) {
       args.push('--effort', safeEffort);
     }
+    if (process.env.AGY_DEBUG_PROMPT === '1') {
+      try {
+        fs.appendFileSync('/tmp/agy-dbg.log',
+          `  RUN args=${JSON.stringify(args)} promptlen=${prompt.length} slug=${slug}\\n`, 'utf8');
+      } catch {}
+    }
 
     const child = spawn(AGY_BIN, args, {
       cwd: AGY_CWD,
