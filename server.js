@@ -123,6 +123,11 @@ function buildPrompt(messages, opts = {}) {
   // Expose the caller's tool catalog so the agent can request one of them
   // instead of only reaching for its own built-in tools. Without this the
   // request is silently ignored and the answer is plain text.
+  //
+  // Only name + one-line description + the flat list of top-level parameter
+  // names. Sending the full JSON schema made a real Hermes request (24 tools)
+  // reach 312KB, which the CLI silently fails to run — no result event, no
+  // error, so the caller only sees an empty answer.
   if (Array.isArray(opts.tools) && opts.tools.length) {
     lines.push('');
     lines.push('=== AVAILABLE TOOLS ===');
@@ -132,12 +137,15 @@ function buildPrompt(messages, opts = {}) {
     for (const t of opts.tools) {
       const fn = (t && t.function) || t || {};
       const name = fn.name || 'unknown';
-      const desc = fn.description ? ` — ${String(fn.description).slice(0, 300)}` : '';
-      let params = '';
-      if (fn.parameters) {
-        try { params = ` | params: ${JSON.stringify(fn.parameters)}`.slice(0, 1200); } catch {}
-      }
-      lines.push(`- ${name}${desc}${params}`);
+      const desc = fn.description ? ` — ${String(fn.description).slice(0, 120)}` : '';
+      let argNames = '';
+      try {
+        const props = fn.parameters && fn.parameters.properties;
+        if (props && typeof props === 'object') {
+          argNames = ` | args: ${Object.keys(props).join(', ')}`;
+        }
+      } catch {}
+      lines.push(`- ${name}${desc}${argNames}`);
     }
   }
 
@@ -360,12 +368,20 @@ function runAgy({ slug, effort, prompt, signal, onDelta, onTool }) {
       finish({ text, usage, status, error: String(e && e.message || e) });
     });
 
-    child.on('close', () => {
-      if (!killed && !text) {
-        finish({ text, usage, status, error: lastError || 'agy exited without output' });
-      } else {
-        finish({ text, usage, status, error: lastError });
+    child.on('close', (code) => {
+      // No result event AND no text: the CLI died before answering. The
+      // oversized-prompt case fails exactly this way (silent death, exit≠0),
+      // so surface the exit code instead of an empty 200 response — a caller
+      // that receives 200+"" just retries the same oversized request.
+      if (!text) {
+        const detail = lastError ? `: ${lastError.slice(0, 300)}` : '';
+        finish({
+          text, usage, status,
+          error: `agy exited without a result event (code ${code})${detail}`,
+        });
+        return;
       }
+      finish({ text, usage, status, error: lastError });
     });
   });
 }
@@ -458,10 +474,6 @@ const server = http.createServer(async (req, res) => {
     let body;
     try { body = JSON.parse(await readBody(req)); }
     catch (e) { return errorResponse(res, 400, 'invalid JSON body: ' + e.message); }
-
-    if (process.env.AGY_DEBUG_PROMPT === '1') {
-      try { fs.appendFileSync('/tmp/agy-debug-body.jsonl', JSON.stringify(body) + '\n', 'utf8'); } catch {}
-    }
 
     const model = body.model || 'antigravity-gemini-3.8-flash';
     const spec = resolveModel(model);
@@ -593,14 +605,6 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (process.env.AGY_DEBUG_PROMPT === '1') {
-      try {
-        fs.appendFileSync('/tmp/agy-debug-final.jsonl', JSON.stringify({
-          text: finalText, status: r.status, error: r.error,
-          has_tools: tools.length, effort: effortOverride ?? spec.effort,
-        }) + '\n', 'utf8');
-      } catch {}
-    }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify(openAIShape(model, finalText, r.usage, 'stop')));
     done();
