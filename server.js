@@ -301,9 +301,6 @@ function resolveModel(name) {
 /** Run a short agy subcommand (e.g. `models`) and capture raw stdout. */
 function runPlain(args, timeoutMs = 30000) {
   return new Promise((resolve) => {
-    if (process.env.AGY_DEBUG_PROMPT === '1') {
-      try { fs.appendFileSync('/tmp/agy-dbg.log', `  ARGS=${JSON.stringify(args)}\n`, 'utf8'); } catch {}
-    }
     const child = spawn(AGY_BIN, args, {
       cwd: AGY_CWD,
       env: process.env,
@@ -351,13 +348,6 @@ function runAgy({ slug, effort, prompt, signal, onDelta, onTool }) {
     if (safeEffort && !/-(low|medium|high)$/.test(slug)) {
       args.push('--effort', safeEffort);
     }
-    if (process.env.AGY_DEBUG_PROMPT === '1') {
-      try {
-        fs.appendFileSync('/tmp/agy-dbg.log',
-          `  RUN args=${JSON.stringify(args)} promptlen=${prompt.length} slug=${slug}\\n`, 'utf8');
-      } catch {}
-    }
-
     const child = spawn(AGY_BIN, args, {
       cwd: AGY_CWD,
       env: { ...process.env, GEMINI_API_KEY: GEMINI_KEY },
@@ -559,10 +549,6 @@ const server = http.createServer(async (req, res) => {
       : null;
     const prompt = buildPrompt(body.messages || [], { language: lang, tools });
     if (!prompt.trim()) return errorResponse(res, 400, 'no messages');
-
-    if (process.env.AGY_DEBUG_PROMPT === '1') {
-      try { fs.appendFileSync('/tmp/agy-dbg.log', `${Date.now()} proplen=${prompt.length} tools=${tools.length} eff=${effortOverride ?? spec.effort} slug=${spec.slug}\n`, 'utf8'); } catch {}
-    }
 
     const controller = new AbortController();
     req.on('close', () => controller.abort());
