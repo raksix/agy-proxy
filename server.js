@@ -474,7 +474,10 @@ const server = http.createServer(async (req, res) => {
       // ACTIVE with no text_delta for minutes. Every client-side stale-stream
       // watchdog sees that as a dead connection, so keep the socket live with
       // comment heartbeats and surface tool activity as reasoning deltas.
-      const hb = setInterval(() => { try { res.write(': hb\n\n'); } catch {} }, 15000);
+      // 5s, not 15s: Hermes' own watchdog treats a ping-only connection as
+      // dead after ~16s, so a 15s interval sat right on the boundary and the
+      // request was dropped mid-turn.
+      const hb = setInterval(() => { try { res.write(': hb\n\n'); } catch {} }, 5000);
       let lastPing = Date.now();
       // Text is buffered (not forwarded live) when tools are on the line: a
       // directive like `TOOL_CALL: x({})` must not reach the user as prose
