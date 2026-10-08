@@ -24,8 +24,11 @@ const AGY_CWD = process.env.AGY_CWD || '/root/agy-proxy/work';
 const MAX_CONCURRENT = Number(process.env.AGY_MAX_CONCURRENT || 3);
 const REQUEST_TIMEOUT_MS = Number(process.env.AGY_TIMEOUT_MS || 300000);
 
-// Gemini key comes from the environment (loaded by start.sh from .env).
-const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
+// No API key is injected: agy authenticates through its own OAuth session
+// (antigravity-oauth-token in ~/.gemini/antigravity-cli). A Gemini provider
+// key is only honoured when the operator explicitly opts in via AGY_USE_GEMINI_KEY.
+const USE_GEMINI_KEY = process.env.AGY_USE_GEMINI_KEY === '1';
+const GEMINI_KEY = USE_GEMINI_KEY ? (process.env.GEMINI_API_KEY || '') : '';
 
 /** Friendly model name -> { slug, effort } */
 const AGY_MODELS = {
@@ -104,6 +107,24 @@ function resolveModel(name) {
 }
 
 // ------------------------------------------------------------------ agy runner
+/** Run a short agy subcommand (e.g. `models`) and capture raw stdout. */
+function runPlain(args, timeoutMs = 30000) {
+  return new Promise((resolve) => {
+    const child = spawn(AGY_BIN, args, {
+      cwd: AGY_CWD,
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch {}
+    }, timeoutMs);
+    child.stdout.on('data', (d) => { out += d.toString(); });
+    child.on('error', () => { clearTimeout(timer); resolve({ status: -1, stdout: '' }); });
+    child.on('close', (code) => { clearTimeout(timer); resolve({ status: code, stdout: out }); });
+  });
+}
+
 /**
  * Run one prompt through agy.
  * Resolves { text, usage, status, error } — `text` is non-empty whenever the
@@ -269,9 +290,18 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (p === '/health' || p === '/healthz') {
+    // Prove the CLI is actually signed in, not merely that the proxy booted.
+    let auth = 'unknown';
+    let authModels = 0;
+    try {
+      const r = await runPlain(['models']);
+      auth = r.status === 0 ? 'authenticated' : 'error';
+      authModels = (r.stdout.match(/gemini-/g) || []).length;
+    } catch (e) { auth = 'error'; }
     res.writeHead(200, { 'content-type': 'application/json' });
     return res.end(JSON.stringify({
-      status: 'ok', gemini_key: GEMINI_KEY ? 'present' : 'missing',
+      status: 'ok', auth, authModels,
+      gemini_key: USE_GEMINI_KEY ? (GEMINI_KEY ? 'injected' : 'missing') : 'not-used',
       running, max: MAX_CONCURRENT, version: '1.0.0',
     }));
   }
