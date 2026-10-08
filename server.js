@@ -267,8 +267,15 @@ function runAgy({ slug, effort, prompt, signal, onDelta, onTool }) {
     // suffix must be stripped before the bare model name is passed through.
     // Every slug in AGY_MODELS ends in -low/-medium/-high, which is exactly
     // the effort the friendly alias asked for, so there is nothing to add.
-    if (effort && !/-(low|medium|high)$/.test(slug)) {
-      args.push('--effort', effort);
+    // Hermes also sends its own reasoning_effort ("none" when the model should
+    // not think), which agy does not accept at all — valid values are only
+    // low/medium/high/xhigh/max, so anything else is dropped.
+    const AGY_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+    const safeEffort = AGY_EFFORTS.has(String(effort || '').toLowerCase())
+      ? String(effort).toLowerCase()
+      : null;
+    if (safeEffort && !/-(low|medium|high)$/.test(slug)) {
+      args.push('--effort', safeEffort);
     }
 
     const child = spawn(AGY_BIN, args, {
@@ -452,14 +459,16 @@ const server = http.createServer(async (req, res) => {
     try { body = JSON.parse(await readBody(req)); }
     catch (e) { return errorResponse(res, 400, 'invalid JSON body: ' + e.message); }
 
-    if (process.env.AGY_DEBUG_PROMPT === '1') {
-      try { fs.writeFileSync('/tmp/agy-debug-body.json', JSON.stringify(body).slice(0, 400000), 'utf8'); } catch {}
-    }
-
     const model = body.model || 'antigravity-gemini-3.8-flash';
     const spec = resolveModel(model);
     const lang = resolveLanguage(req, body, url);
     const tools = Array.isArray(body.tools) ? body.tools : [];
+    // Hermes sends reasoning_effort ("none" to disable thinking); when present it
+    // must override the alias default, otherwise a reasoning-forced client gets
+    // an effort it never asked for.
+    const effortOverride = body.reasoning_effort !== undefined
+      ? String(body.reasoning_effort || '').toLowerCase()
+      : null;
     const prompt = buildPrompt(body.messages || [], { language: lang, tools });
     if (!prompt.trim()) return errorResponse(res, 400, 'no messages');
 
@@ -497,7 +506,7 @@ const server = http.createServer(async (req, res) => {
       const liveText = tools.length === 0;
 
       const r = await runAgy({
-        slug: spec.slug, effort: spec.effort, prompt,
+        slug: spec.slug, effort: effortOverride ?? spec.effort, prompt,
         signal: controller.signal,
         onDelta: (delta) => {
           acc += delta;
@@ -553,7 +562,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    const r = await runAgy({ slug: spec.slug, effort: spec.effort, prompt, signal: controller.signal });
+    const r = await runAgy({ slug: spec.slug, effort: effortOverride ?? spec.effort, prompt, signal: controller.signal });
     const finalText = r.text;
     if (!finalText) {
       done();
