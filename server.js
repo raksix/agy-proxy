@@ -318,9 +318,10 @@ function runAgy({ slug, effort, prompt, signal, onDelta, onTool }) {
           }
           // A tool step going ACTIVE means the agent is mid-action and will
           // emit nothing else for a while — report it so the client can show
-          // progress instead of treating the silence as a stall.
-          if (su.tool_name && su.state === 'ACTIVE' && onTool) {
-            onTool(su.tool_name);
+          // progress instead of treating the silence as a stall. DONE is
+          // reported too, otherwise a fast tool is never seen at all.
+          if (su.tool_name && su.state && onTool) {
+            onTool(su.tool_name, su.state);
           }
           if (su.usage) usage = su.usage;
         } else if (ev.event === 'result' && ev.result) {
@@ -495,12 +496,13 @@ const server = http.createServer(async (req, res) => {
               choices: [{ index: 0, delta: { content: delta }, finish_reason: null }] });
           }
         },
-        onTool: (tool) => {
+        onTool: (tool, state) => {
           lastPing = Date.now();
           // Emitted as reasoning content, which Hermes renders as thinking/activity
           // rather than polluting the visible answer.
+          const label = state === 'DONE' ? `[agy: ${tool} → done]` : `[agy: ${tool}]`;
           sse(res, { id, object: 'chat.completion.chunk', created: now(), model,
-            choices: [{ index: 0, delta: { reasoning_content: `[agy: ${tool}]` }, finish_reason: null }] });
+            choices: [{ index: 0, delta: { reasoning_content: label }, finish_reason: null }] });
         },
       });
       clearInterval(hb);
