@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
-# Persistent agy login driver (see README). Keeps a FIFO-backed stdin alive so
-# the CLI never sees EOF between the URL appearing and the code being pasted.
+# Interactive login helper for the Antigravity CLI (`agy`).
+#
+# `agy` needs a browser OAuth flow that no headless API call can satisfy, and
+# its stdin reader closes as soon as the launching shell exits — which also
+# discards the PKCE verifier and invalidates the code. This script keeps the
+# process alive through a FIFO so a code can be pasted into it later:
+#
+#   bash login-driver.sh                 # prints the auth URL
+#   echo "4/0AXlq..." > /tmp/agy_in      # paste the code
+#
+# The completed session is stored in
+# ~/.gemini/antigravity-cli/antigravity-oauth-token, which the proxy reads
+# through the CLI itself — no key is ever written to disk here.
 set -u
 
 FIFO=/tmp/agy_in
@@ -13,16 +24,19 @@ mkfifo "$FIFO"
 
 cd /root
 
+# Hold the FIFO open so agy's stdin never sees EOF.
 ( sleep 7200 > "$FIFO" ) &
 echo $! > /tmp/agy_holder.pid
 
 tail -f "$FIFO" | agy --print="Waiting." --dangerously-skip-permissions --print-timeout 3600s > "$OUT" 2>&1 &
 echo $! > /tmp/agy_pid.txt
 
-sleep 10
-echo "--- output so far ---"
-tail -8 "$OUT"
-echo "--- url ---"
-URL=$(grep -oE 'https://accounts\.google\.com/o/oauth2/auth[^ ]+' "$OUT" | head -1)
-echo "$URL" > /tmp/agy_url5.txt
-echo "${#URL} chars"
+# Give the CLI time to compute the PKCE challenge and print the URL.
+for _ in $(seq 1 20); do
+  sleep 2
+  if grep -qE 'https://accounts\.google\.com' "$OUT" 2>/dev/null; then break; fi
+done
+
+echo "--- open this URL in a browser and sign in ---"
+grep -oE 'https://accounts\.google\.com/o/oauth2/auth[^ ]+' "$OUT" | head -1
+echo "--- then paste the code:  echo '<code>' > $FIFO"
