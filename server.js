@@ -133,37 +133,25 @@ function runPlain(args, timeoutMs = 30000) {
  */
 function runAgy({ slug, effort, prompt, signal, onDelta }) {
   return new Promise((resolve, reject) => {
-    // The full Hermes system prompt easily exceeds the exec argv limit
-    // (E2BIG), so agy never receives it as an argument. Pass it via a
-    // temporary file read back through the shell instead.
-    const promptFile = path.join(
-      fs.mkdtempSync(path.join(AGY_CWD, '.pr-')),
-      'prompt.txt'
-    );
-    fs.writeFileSync(promptFile, prompt, 'utf8');
-
+    // Pass prompt via stdin using `--input-format text` so the prompt size
+    // is unlimited and never hits kernel exec argv limits (E2BIG).
     const args = [
-      '--print', `$(cat ${JSON.stringify(promptFile)})`,
-      '--model', slug,
+      '--input-format', 'text',
       '--output-format', 'stream-json',
+      '--model', slug,
       '--dangerously-skip-permissions',
       '--print-timeout', String(Math.ceil(REQUEST_TIMEOUT_MS / 1000)) + 's',
     ];
     if (effort) args.push('--effort', effort);
 
-    const cleanup = () => {
-      try { fs.rmSync(path.dirname(promptFile), { recursive: true, force: true }); } catch {}
-    };
-
-    const child = spawn('/bin/sh', ['-c',
-      `exec ${JSON.stringify(AGY_BIN)} "$@"`,
-      'agy-shim', // $0 for the shim (unused by agy)
-      ...args,
-    ], {
+    const child = spawn(AGY_BIN, args, {
       cwd: AGY_CWD,
       env: { ...process.env, GEMINI_API_KEY: GEMINI_KEY },
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
     });
+
+    child.stdin.on('error', () => {});
+    child.stdin.end(prompt, 'utf8');
 
     let buf = '';
     let text = '';
@@ -177,7 +165,6 @@ function runAgy({ slug, effort, prompt, signal, onDelta }) {
       if (finalized) return;
       finalized = true;
       clearTimeout(hardTimer);
-      cleanup();
       resolve(payload);
     };
 
