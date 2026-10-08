@@ -280,14 +280,6 @@ function runAgy({ slug, effort, prompt, signal, onDelta, onTool }) {
     child.stdin.on('error', () => {});
     child.stdin.end(prompt, 'utf8');
 
-    // TEMP DEBUG
-    if (process.env.AGY_DEBUG_PROMPT === '1') {
-      try {
-        fs.writeFileSync('/tmp/agy-debug-prompt.txt', prompt, 'utf8');
-        fs.appendFileSync('/tmp/agy-debug-args.txt', JSON.stringify(args) + '\n', 'utf8');
-      } catch {}
-    }
-
     let buf = '';
     let text = '';
     let usage = null;
