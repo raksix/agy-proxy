@@ -459,6 +459,10 @@ const server = http.createServer(async (req, res) => {
     try { body = JSON.parse(await readBody(req)); }
     catch (e) { return errorResponse(res, 400, 'invalid JSON body: ' + e.message); }
 
+    if (process.env.AGY_DEBUG_PROMPT === '1') {
+      try { fs.writeFileSync('/tmp/agy-debug-body.json', JSON.stringify(body), 'utf8'); } catch {}
+    }
+
     const model = body.model || 'antigravity-gemini-3.8-flash';
     const spec = resolveModel(model);
     const lang = resolveLanguage(req, body, url);
@@ -589,6 +593,14 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (process.env.AGY_DEBUG_PROMPT === '1') {
+      try {
+        fs.writeFileSync('/tmp/agy-debug-final.json', JSON.stringify({
+          text: finalText, status: r.status, error: r.error, usage: r.usage,
+          has_tools: tools.length, effort: effortOverride ?? spec.effort,
+        }), 'utf8');
+      } catch {}
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify(openAIShape(model, finalText, r.usage, 'stop')));
     done();
