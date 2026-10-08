@@ -262,7 +262,14 @@ function runAgy({ slug, effort, prompt, signal, onDelta, onTool }) {
       '--dangerously-skip-permissions',
       '--print-timeout', String(Math.ceil(REQUEST_TIMEOUT_MS / 1000)) + 's',
     ];
-    if (effort) args.push('--effort', effort);
+    // agy REJECTS an --effort flag when the model slug already encodes one
+    // ("--model gemini-3.7-flash-medium conflicts with --effort=low"), so the
+    // suffix must be stripped before the bare model name is passed through.
+    // Every slug in AGY_MODELS ends in -low/-medium/-high, which is exactly
+    // the effort the friendly alias asked for, so there is nothing to add.
+    if (effort && !/-(low|medium|high)$/.test(slug)) {
+      args.push('--effort', effort);
+    }
 
     const child = spawn(AGY_BIN, args, {
       cwd: AGY_CWD,
